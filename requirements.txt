@@ -1,0 +1,7 @@
+aiohttp
+mss
+pyautogui
+pillow
+pyperclip
+pyngrok
+customtkinter
