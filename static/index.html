@@ -1,284 +1,354 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Remote Desktop Client</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>PyRemote Web Client</title>
     <style>
-        body { 
-            margin: 0; 
-            padding: 0; 
-            overflow: hidden; 
-            background: #222; 
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Segoe UI', sans-serif;
+            color: white;
         }
-        #screen-container {
+        #login-overlay {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.9);
             display: flex;
             justify-content: center;
             align-items: center;
-            height: 100vh;
-            width: 100vw;
+            z-index: 1000;
         }
-        #screen { 
-            cursor: none; 
+        .login-box {
+            background: #1e1e1e;
+            padding: 40px;
+            border-radius: 10px;
+            text-align: center;
+            width: 300px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+        }
+        input {
+            width: 100%;
+            padding: 10px;
+            margin: 10px 0;
+            background: #333;
+            border: 1px solid #444;
+            color: white;
+            border-radius: 5px;
+            font-size: 16px;
+        }
+        button {
+            width: 100%;
+            padding: 10px;
+            background: #007aff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            font-size: 16px;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        button:hover { background: #0056b3; }
+        #canvas-container {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        canvas {
             max-width: 100%;
             max-height: 100%;
-            object-fit: contain;
-            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            cursor: none; /* Hide default cursor */
         }
-        
-        /* Floating Toolbar */
+        #status-bar {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.5);
+            padding: 5px 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            pointer-events: none;
+            z-index: 100;
+        }
         #toolbar {
-            position: fixed;
+            position: absolute;
             bottom: 20px;
             left: 50%;
             transform: translateX(-50%);
-            background: rgba(40, 40, 40, 0.9);
-            padding: 10px 20px;
-            border-radius: 12px;
+            background: rgba(30,30,30,0.8);
+            padding: 10px;
+            border-radius: 30px;
             display: flex;
-            gap: 10px;
-            align-items: center;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.4);
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(255,255,255,0.1);
+            gap: 15px;
             transition: opacity 0.3s;
-            opacity: 0.2; /* Fade out when idle */
+            opacity: 0.3;
         }
-        #toolbar:hover {
-            opacity: 1;
-        }
-        
-        input[type="text"] {
-            background: rgba(255,255,255,0.1);
-            border: 1px solid rgba(255,255,255,0.2);
-            color: white;
-            padding: 8px 12px;
-            border-radius: 6px;
-            outline: none;
-            width: 200px;
-        }
-        input[type="text"]:focus {
-            border-color: #007AFF;
-            background: rgba(255,255,255,0.15);
-        }
-        
-        button {
-            background: #444;
-            color: white;
+        #toolbar:hover { opacity: 1; }
+        .tool-btn {
+            background: none;
             border: none;
-            padding: 8px 12px;
-            border-radius: 6px;
+            color: white;
             cursor: pointer;
-            font-size: 14px;
-            transition: background 0.2s;
+            font-size: 20px;
         }
-        button:hover {
-            background: #555;
+        #audio-status {
+            color: #aaa;
         }
-        button:active {
-            background: #333;
-        }
-        button.primary {
-            background: #007AFF;
-        }
-        button.primary:hover {
-            background: #0062CC;
-        }
-        
-        .status-indicator {
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            background: #ff3b30; /* Red = Offline */
-            margin-right: 10px;
-        }
-        .status-indicator.connected {
-            background: #34c759; /* Green = Online */
-            box-shadow: 0 0 8px #34c759;
-        }
-        
-        .divider {
-            width: 1px;
-            height: 24px;
-            background: rgba(255,255,255,0.2);
-            margin: 0 5px;
-        }
+        .active { color: #00ff00; }
     </style>
 </head>
 <body>
-    <div id="screen-container">
-        <img id="screen" src="" alt="Waiting for connection...">
+
+    <div id="login-overlay">
+        <div class="login-box">
+            <h2>PyRemote Pro</h2>
+            <p style="color:#aaa; font-size:14px; margin-bottom:20px;">Web Client v1.0</p>
+            <input type="password" id="password" placeholder="请输入访问验证码" autofocus>
+            <button onclick="connect()">连接</button>
+            <p id="error-msg" style="color:red; margin-top:10px; font-size:12px;"></p>
+        </div>
+    </div>
+
+    <div id="status-bar">
+        Status: <span id="status-text">Disconnected</span> | FPS: <span id="fps">0</span> | Ping: <span id="ping">0</span>ms
+    </div>
+
+    <div id="canvas-container">
+        <canvas id="remote-screen"></canvas>
     </div>
 
     <div id="toolbar">
-        <div id="status" class="status-indicator" title="Disconnected"></div>
-        
-        <input type="text" id="remote-input" placeholder="Type text to send..." onkeydown="if(event.key==='Enter') sendText()">
-        <button onclick="sendText()" class="primary">Send Type</button>
-        
-        <div class="divider"></div>
-        
-        <button onclick="sendClipboard()" title="Send local clipboard to remote">Send Clip</button>
-        <button onclick="getClipboard()" title="Get remote clipboard to local">Get Clip</button>
+        <button class="tool-btn" title="Toggle Fullscreen" onclick="toggleFullscreen()">⛶</button>
+        <button class="tool-btn" title="Keyboard" onclick="toggleKeyboard()">⌨</button>
+        <button class="tool-btn" id="audio-btn" title="Audio" onclick="toggleAudio()">🔊</button>
+        <button class="tool-btn" title="Settings" onclick="showSettings()">⚙</button>
     </div>
 
     <script>
-        const img = document.getElementById('screen');
-        const statusEl = document.getElementById('status');
-        const ws = new WebSocket(`ws://${location.host}/ws`);
-
-        ws.onopen = () => {
-            console.log('Connected');
-            statusEl.classList.add('connected');
-            statusEl.title = "Connected";
-        };
-
-        ws.onmessage = async (event) => {
-            const msg = JSON.parse(event.data);
-            
-            if (msg.type === 'frame') {
-                img.src = 'data:image/jpeg;base64,' + msg.data;
-            } else if (msg.type === 'clipboard_text') {
-                try {
-                    await navigator.clipboard.writeText(msg.text);
-                    alert('Remote clipboard copied to local!');
-                } catch (err) {
-                    console.error('Failed to write clipboard: ', err);
-                    alert('Failed to copy to clipboard. Browser permission denied?');
-                }
-            }
-        };
-
-        ws.onclose = () => {
-            console.log('Disconnected');
-            statusEl.classList.remove('connected');
-            statusEl.title = "Disconnected";
-        };
-
-        // --- Features ---
-
-        function sendText() {
-            const input = document.getElementById('remote-input');
-            const text = input.value;
-            if (!text) return;
-            
-            ws.send(JSON.stringify({ action: 'type_text', text: text }));
-            input.value = ''; // Clear input
-        }
-
-        async function sendClipboard() {
-            try {
-                const text = await navigator.clipboard.readText();
-                ws.send(JSON.stringify({ action: 'clipboard_set', text: text }));
-                // alert('Local clipboard sent to remote!'); // Optional feedback
-            } catch (err) {
-                console.error('Failed to read clipboard: ', err);
-                alert('Failed to read local clipboard. Please allow clipboard access.');
-            }
-        }
-
-        function getClipboard() {
-            ws.send(JSON.stringify({ action: 'clipboard_get' }));
-        }
-
-        // --- Input Handling ---
+        let ws;
+        let canvas = document.getElementById('remote-screen');
+        let ctx = canvas.getContext('2d');
+        let authenticated = false;
+        let frameCount = 0;
+        let lastPing = 0;
         
-        function getCoords(e) {
-            const rect = img.getBoundingClientRect();
-            const scaleX = img.naturalWidth / rect.width;
-            const scaleY = img.naturalHeight / rect.height;
-            return {
-                x: Math.round((e.clientX - rect.left) * scaleX),
-                y: Math.round((e.clientY - rect.top) * scaleY)
+        // Audio Context
+        let audioCtx;
+        let nextStartTime = 0;
+
+        function connect() {
+            const password = document.getElementById('password').value;
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const host = window.location.host;
+            const url = `${protocol}//${host}/ws`;
+
+            document.getElementById('status-text').innerText = 'Connecting...';
+            
+            ws = new WebSocket(url);
+
+            ws.onopen = () => {
+                console.log('Connected');
+                ws.send(JSON.stringify({ action: 'auth', password: password }));
+            };
+
+            ws.onmessage = async (event) => {
+                const msg = JSON.parse(event.data);
+                
+                if (msg.type === 'auth_result') {
+                    if (msg.status === 'ok') {
+                        authenticated = true;
+                        document.getElementById('login-overlay').style.display = 'none';
+                        document.getElementById('status-text').innerText = 'Connected';
+                        startInputHandling();
+                        initAudio();
+                    } else {
+                        document.getElementById('error-msg').innerText = '验证码错误';
+                        ws.close();
+                    }
+                } else if (msg.type === 'frame') {
+                    renderFrame(msg);
+                } else if (msg.type === 'audio') {
+                    playAudio(msg.data);
+                } else if (msg.type === 'clipboard_text') {
+                    navigator.clipboard.writeText(msg.text).catch(err => console.error('Clipboard write failed', err));
+                }
+            };
+
+            ws.onclose = () => {
+                document.getElementById('status-text').innerText = 'Disconnected';
+                document.getElementById('login-overlay').style.display = 'flex';
+                authenticated = false;
             };
         }
 
-        let lastMove = 0;
-        img.addEventListener('mousemove', (e) => {
-            const now = Date.now();
-            if (now - lastMove < 30) return; 
-            lastMove = now;
+        function renderFrame(msg) {
+            const img = new Image();
+            img.onload = () => {
+                // Resize canvas to fit window while maintaining aspect ratio
+                // Actually, let's keep canvas size = image size and use CSS to scale
+                if (canvas.width !== img.width || canvas.height !== img.height) {
+                    canvas.width = img.width;
+                    canvas.height = img.height;
+                }
+                ctx.drawImage(img, 0, 0);
+            };
+            img.src = "data:image/jpeg;base64," + msg.data;
             
-            const { x, y } = getCoords(e);
-            ws.send(JSON.stringify({ action: 'mousemove', x, y }));
-        });
-
-        img.addEventListener('mousedown', (e) => {
-            const { x, y } = getCoords(e);
-            ws.send(JSON.stringify({ action: 'mousemove', x, y }));
-            
-            let button = 'left';
-            if (e.button === 2) button = 'right';
-            if (e.button === 1) button = 'middle';
-            ws.send(JSON.stringify({ action: 'mousedown', button }));
-        });
-
-        img.addEventListener('mouseup', (e) => {
-            let button = 'left';
-            if (e.button === 2) button = 'right';
-            if (e.button === 1) button = 'middle';
-            ws.send(JSON.stringify({ action: 'mouseup', button }));
-        });
-
-        img.addEventListener('contextmenu', e => e.preventDefault());
-
-        window.addEventListener('keydown', (e) => {
-            // Ignore if typing in the input box
-            if (document.activeElement.tagName === 'INPUT') return;
-
-            let key = e.key;
-            // Map keys for PyAutoGUI
-            if (key === 'ArrowUp') key = 'up';
-            if (key === 'ArrowDown') key = 'down';
-            if (key === 'ArrowLeft') key = 'left';
-            if (key === 'ArrowRight') key = 'right';
-            if (key === 'Control') key = 'ctrl'; // Mac: Ctrl is Ctrl
-            if (key === 'Meta') key = 'command'; // Mac: Command
-            if (key === 'Alt') key = 'alt';
-            if (key === 'Shift') key = 'shift';
-            if (key === 'Escape') key = 'esc';
-            if (key === 'Enter') key = 'enter';
-            if (key === 'Backspace') key = 'backspace';
-            if (key === 'Tab') key = 'tab';
-            
-            // Only send if not a modifier-only press? No, send everything.
-            ws.send(JSON.stringify({ action: 'keydown', key: key.toLowerCase() }));
-            
-            // Prevent default browser actions for some keys
-            if (['Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.key)) {
-                e.preventDefault();
+            frameCount++;
+            if (msg.ts) {
+                const now = Date.now();
+                const latency = now - msg.ts;
+                document.getElementById('ping').innerText = Math.round(latency);
             }
-            // Prevent Ctrl+S, Ctrl+P etc if possible
-            if ((e.ctrlKey || e.metaKey) && ['s', 'p', 'f'].includes(e.key.toLowerCase())) {
-                e.preventDefault();
-            }
-        });
+        }
 
-        window.addEventListener('keyup', (e) => {
-            if (document.activeElement.tagName === 'INPUT') return;
+        // FPS Counter
+        setInterval(() => {
+            document.getElementById('fps').innerText = frameCount;
+            frameCount = 0;
+        }, 1000);
+
+        // Input Handling
+        function startInputHandling() {
+            // Mouse
+            canvas.addEventListener('mousemove', (e) => {
+                if (!authenticated) return;
+                const rect = canvas.getBoundingClientRect();
+                const scaleX = canvas.width / rect.width;
+                const scaleY = canvas.height / rect.height;
+                
+                const xp = (e.clientX - rect.left) / rect.width;
+                const yp = (e.clientY - rect.top) / rect.height;
+
+                // Throttle? For now just send
+                ws.send(JSON.stringify({
+                    action: 'mousemove',
+                    xp: Math.max(0, Math.min(1, xp)),
+                    yp: Math.max(0, Math.min(1, yp))
+                }));
+            });
+
+            canvas.addEventListener('mousedown', (e) => {
+                if (!authenticated) return;
+                const btn = e.button === 0 ? 'left' : (e.button === 2 ? 'right' : 'middle');
+                ws.send(JSON.stringify({ action: 'mousedown', button: btn }));
+            });
+
+            canvas.addEventListener('mouseup', (e) => {
+                if (!authenticated) return;
+                const btn = e.button === 0 ? 'left' : (e.button === 2 ? 'right' : 'middle');
+                ws.send(JSON.stringify({ action: 'mouseup', button: btn }));
+            });
             
-            let key = e.key;
-            if (key === 'ArrowUp') key = 'up';
-            if (key === 'ArrowDown') key = 'down';
-            if (key === 'ArrowLeft') key = 'left';
-            if (key === 'ArrowRight') key = 'right';
-            if (key === 'Control') key = 'ctrl';
-            if (key === 'Meta') key = 'command';
-            if (key === 'Alt') key = 'alt';
-            if (key === 'Shift') key = 'shift';
-            if (key === 'Escape') key = 'esc';
-            if (key === 'Enter') key = 'enter';
-            if (key === 'Backspace') key = 'backspace';
-            if (key === 'Tab') key = 'tab';
+            // Prevent context menu
+            canvas.addEventListener('contextmenu', e => e.preventDefault());
+            
+            // Scroll
+            window.addEventListener('wheel', (e) => {
+                if (!authenticated) return;
+                ws.send(JSON.stringify({ action: 'scroll', dy: -e.deltaY })); // Invert logic maybe?
+            }, { passive: true });
 
-            ws.send(JSON.stringify({ action: 'keyup', key: key.toLowerCase() }));
-        });
+            // Keyboard
+            window.addEventListener('keydown', (e) => {
+                if (!authenticated) return;
+                ws.send(JSON.stringify({ action: 'keydown', key: mapKey(e.key) }));
+                e.preventDefault();
+            });
+
+            window.addEventListener('keyup', (e) => {
+                if (!authenticated) return;
+                ws.send(JSON.stringify({ action: 'keyup', key: mapKey(e.key) }));
+                e.preventDefault();
+            });
+        }
+
+        function mapKey(key) {
+            // Simple mapping, improve as needed
+            const map = {
+                'Enter': 'enter',
+                'Backspace': 'backspace',
+                'Tab': 'tab',
+                'Escape': 'esc',
+                'ArrowUp': 'up',
+                'ArrowDown': 'down',
+                'ArrowLeft': 'left',
+                'ArrowRight': 'right',
+                'Control': 'ctrl',
+                'Shift': 'shift',
+                'Alt': 'alt',
+                'Meta': 'command'
+            };
+            return map[key] || key.toLowerCase();
+        }
+
+        // Audio
+        function initAudio() {
+            const AudioContext = window.AudioContext || window.webkitAudioContext;
+            audioCtx = new AudioContext();
+            nextStartTime = audioCtx.currentTime;
+        }
+
+        function playAudio(b64Data) {
+            if (!audioCtx) return;
+            
+            // Convert Base64 to ArrayBuffer
+            const binaryString = window.atob(b64Data);
+            const len = binaryString.length;
+            const bytes = new Int16Array(len / 2); // 16-bit PCM
+            for (let i = 0; i < len; i += 2) {
+                bytes[i / 2] = (binaryString.charCodeAt(i+1) << 8) | binaryString.charCodeAt(i);
+            }
+            
+            // Create Buffer (Assuming 48000Hz, 2ch from server)
+            const buffer = audioCtx.createBuffer(2, bytes.length / 2, 48000);
+            const ch0 = buffer.getChannelData(0);
+            const ch1 = buffer.getChannelData(1);
+            
+            // Int16 to Float32
+            for (let i = 0; i < bytes.length; i+=2) {
+                ch0[i/2] = bytes[i] / 32768.0;
+                ch1[i/2] = bytes[i+1] / 32768.0;
+            }
+
+            const source = audioCtx.createBufferSource();
+            source.buffer = buffer;
+            source.connect(audioCtx.destination);
+            
+            // Simple jitter buffer logic
+            if (nextStartTime < audioCtx.currentTime) nextStartTime = audioCtx.currentTime;
+            source.start(nextStartTime);
+            nextStartTime += buffer.duration;
+        }
+
+        function toggleFullscreen() {
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen();
+            } else {
+                if (document.exitFullscreen) {
+                    document.exitFullscreen();
+                }
+            }
+        }
         
-        window.addEventListener('wheel', (e) => {
-             ws.send(JSON.stringify({ action: 'scroll', dy: -e.deltaY }));
-        }, { passive: true });
-
+        function toggleAudio() {
+             if (audioCtx && audioCtx.state === 'suspended') {
+                 audioCtx.resume();
+                 document.getElementById('audio-btn').classList.add('active');
+             } else {
+                 // logic to mute?
+             }
+        }
+        
+        // Touch Support (Basic)
+        // Map touch to mouse...
     </script>
 </body>
 </html>

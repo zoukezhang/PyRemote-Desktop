@@ -18,8 +18,18 @@ import mss
 import pyautogui
 import pyperclip
 from aiohttp import web
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageGrab
 from pyngrok import ngrok, conf
+
+# Audio Support
+try:
+    import pyaudiowpatch as pyaudio
+except ImportError:
+    try:
+        import pyaudio
+    except ImportError:
+        pyaudio = None
+        print("DEBUG: PyAudio not found. Audio disabled.")
 
 # --- Direct Input & Power Management Helpers ---
 
@@ -128,6 +138,7 @@ class RemoteDesktopServer:
         self.monitor_left = 0
         self.monitor_top = 0
         self.monitor_index = 0 # Default to Monitor 0 (or smart detect)
+        self.force_full_frame = False # Flag to force a full frame update (e.g., new client)
         
         # File Transfer State
         self.receiving_file = False
@@ -139,6 +150,13 @@ class RemoteDesktopServer:
         # SSH Tunnel Variables
         self.ssh_process = None
         
+        # Audio Variables
+        self.audio_p = None
+        self.audio_stream = None
+        self.audio_thread = None
+        self.audio_running = False
+        self.audio_config = {'rate': 48000, 'channels': 2}
+        
         # Performance Settings (Default: Balanced)
         self.target_res = (1280, 720) # Default
         self.jpeg_quality = 30  # <--- Fix: Lower quality for speed
@@ -147,14 +165,18 @@ class RemoteDesktopServer:
         # Setup GUI
         self.root = ctk.CTk()
         self.root.title("远程桌面服务端 - Pro")
-        self.root.geometry("500x800") 
+        self.root.geometry("500x900") # Increased height
         self.root.resizable(False, True)
         
         self.setup_ui()
         
     def setup_ui(self):
+        # Create Scrollable Frame for Main Content
+        self.main_scroll = ctk.CTkScrollableFrame(self.root, fg_color="transparent")
+        self.main_scroll.pack(fill="both", expand=True)
+        
         # 1. Hero Header (Status)
-        self.header_frame = ctk.CTkFrame(self.root, corner_radius=0, fg_color="transparent")
+        self.header_frame = ctk.CTkFrame(self.main_scroll, corner_radius=0, fg_color="transparent")
         self.header_frame.pack(fill="x", padx=20, pady=(20, 10))
         
         title = ctk.CTkLabel(self.header_frame, text="远程桌面控制", font=("SF Pro Display", 24, "bold"))
@@ -176,7 +198,7 @@ class RemoteDesktopServer:
             ctk.CTkButton(self.header_frame, text="重启为管理员", command=self.restart_as_admin, height=24, fg_color="#FF5555", hover_color="#CC0000").pack(side="right", padx=10)
         
         # 2. Connection Card
-        self.conn_frame = ctk.CTkFrame(self.root)
+        self.conn_frame = ctk.CTkFrame(self.main_scroll)
         self.conn_frame.pack(fill="x", padx=20, pady=10)
         
         ctk.CTkLabel(self.conn_frame, text="连接信息", font=("Arial", 14, "bold")).pack(anchor="w", padx=15, pady=(15, 5))
@@ -194,8 +216,26 @@ class RemoteDesktopServer:
         # Refresh Btn
         ctk.CTkButton(self.conn_frame, text="刷新验证码", command=self.refresh_password, height=24, width=100).pack(pady=10)
 
-        # 3. Settings Card
-        self.settings_frame = ctk.CTkFrame(self.root)
+        # 3. Chat Card (New)
+        self.chat_frame_ui = ctk.CTkFrame(self.main_scroll)
+        self.chat_frame_ui.pack(fill="x", padx=20, pady=10)
+        ctk.CTkLabel(self.chat_frame_ui, text="在线聊天", font=("Arial", 14, "bold")).pack(anchor="w", padx=15, pady=(15, 5))
+        
+        self.chat_history = ctk.CTkTextbox(self.chat_frame_ui, height=100, state="disabled")
+        self.chat_history.pack(fill="x", padx=15, pady=(0, 5))
+        
+        self.chat_input_frame = ctk.CTkFrame(self.chat_frame_ui, fg_color="transparent")
+        self.chat_input_frame.pack(fill="x", padx=15, pady=(0, 15))
+        
+        self.chat_entry = ctk.CTkEntry(self.chat_input_frame, placeholder_text="发送消息给客户端...")
+        self.chat_entry.pack(side="left", fill="x", expand=True)
+        self.chat_entry.bind("<Return>", lambda e: self.send_chat())
+        
+        self.btn_send = ctk.CTkButton(self.chat_input_frame, text="发送", width=60, command=self.send_chat)
+        self.btn_send.pack(side="right", padx=(5, 0))
+
+        # 4. Settings Card
+        self.settings_frame = ctk.CTkFrame(self.main_scroll)
         self.settings_frame.pack(fill="x", padx=20, pady=10)
         
         ctk.CTkLabel(self.settings_frame, text="画质与性能", font=("Arial", 14, "bold")).pack(anchor="w", padx=15, pady=(15, 5))
@@ -218,22 +258,88 @@ class RemoteDesktopServer:
         self.chk_gray.pack(anchor="w", padx=15, pady=(5, 15))
 
         # 4. Tools Card (Firewall & Tunnel)
-        self.tools_frame = ctk.CTkFrame(self.root)
+        self.tools_frame = ctk.CTkFrame(self.main_scroll)
         self.tools_frame.pack(fill="x", padx=20, pady=10)
         
-        ctk.CTkLabel(self.tools_frame, text="高级工具", font=("Arial", 14, "bold")).pack(anchor="w", padx=15, pady=(15, 5))
+        ctk.CTkLabel(self.tools_frame, text="高级工具", font=("Arial", 16, "bold"), text_color="white").pack(anchor="w", padx=15, pady=(15, 5)) # High contrast font
         
         # Firewall
-        ctk.CTkButton(self.tools_frame, text="一键放行防火墙 (修复连接失败)", command=self.fix_firewall, fg_color="transparent", border_width=1).pack(fill="x", padx=15, pady=5)
+        ctk.CTkButton(self.tools_frame, text="一键放行防火墙 (修复连接失败)", command=self.fix_firewall, fg_color="transparent", border_width=1, text_color=("gray10", "gray90")).pack(fill="x", padx=15, pady=5)
         
         # Ngrok
         self.use_ngrok = ctk.BooleanVar()
-        self.chk_ngrok = ctk.CTkSwitch(self.tools_frame, text="启用 Ngrok 公网穿透", variable=self.use_ngrok)
+        self.chk_ngrok = ctk.CTkSwitch(self.tools_frame, text="启用 Ngrok 公网穿透", variable=self.use_ngrok, font=("Arial", 12))
         self.chk_ngrok.pack(anchor="w", padx=15, pady=10)
         ctk.CTkButton(self.tools_frame, text="配置 Ngrok 令牌", command=self.set_ngrok_token, height=24).pack(fill="x", padx=15, pady=(0, 15))
 
+        # SSH Tunnel
+        ctk.CTkLabel(self.tools_frame, text="自建 SSH 隧道 (高级)", font=("Arial", 14, "bold")).pack(anchor="w", padx=15, pady=(15, 5))
+        
+        self.use_ssh = ctk.BooleanVar()
+        self.chk_ssh = ctk.CTkSwitch(self.tools_frame, text="启用 SSH 转发", variable=self.use_ssh, command=self.toggle_ssh_ui, font=("Arial", 12))
+        self.chk_ssh.pack(anchor="w", padx=15, pady=5)
+        
+        self.ssh_frame = ctk.CTkFrame(self.tools_frame, fg_color="transparent") # Transparent background
+        # Don't pack immediately, toggle with switch
+        
+        # SSH Host
+        ctk.CTkLabel(self.ssh_frame, text="服务器 IP:", font=("Arial", 12)).pack(anchor="w", padx=5)
+        self.entry_ssh_host = ctk.CTkEntry(self.ssh_frame, placeholder_text="1.2.3.4")
+        self.entry_ssh_host.pack(fill="x", padx=5, pady=2)
+        
+        # SSH User
+        ctk.CTkLabel(self.ssh_frame, text="用户名:", font=("Arial", 12)).pack(anchor="w", padx=5)
+        self.entry_ssh_user = ctk.CTkEntry(self.ssh_frame, placeholder_text="root")
+        self.entry_ssh_user.insert(0, "root")
+        self.entry_ssh_user.pack(fill="x", padx=5, pady=2)
+        
+        # Remote Port
+        ctk.CTkLabel(self.ssh_frame, text="远程端口 (映射到本机8080):", font=("Arial", 12)).pack(anchor="w", padx=5)
+        self.entry_ssh_port = ctk.CTkEntry(self.ssh_frame, placeholder_text="8080")
+        self.entry_ssh_port.insert(0, "8080")
+        self.entry_ssh_port.pack(fill="x", padx=5, pady=2)
+
         # Handle Close
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+        # Auto Start
+        self.root.after(500, self.auto_start)
+
+    def auto_start(self):
+        print("DEBUG: Auto starting server...")
+        self.btn_start.select()
+        self.toggle_server()
+
+    def send_chat(self):
+        text = self.chat_entry.get().strip()
+        if not text: return
+        
+        self.chat_entry.delete(0, tk.END)
+        self.append_chat("我", text)
+        
+        # Broadcast
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(self.broadcast_chat(text), self.loop)
+
+    def append_chat(self, sender, text):
+        self.chat_history.configure(state="normal")
+        self.chat_history.insert(tk.END, f"[{sender}]: {text}\n")
+        self.chat_history.see(tk.END)
+        self.chat_history.configure(state="disabled")
+
+    async def broadcast_chat(self, text):
+        msg = {'type': 'chat', 'sender': 'Server', 'message': text}
+        for ws, state in self.clients.items():
+            if state['authenticated']:
+                try:
+                    await ws.send_json(msg)
+                except: pass
+
+    def toggle_ssh_ui(self):
+        if self.use_ssh.get():
+            self.ssh_frame.pack(fill="x", padx=15, pady=5)
+        else:
+            self.ssh_frame.pack_forget()
 
     def restart_as_admin(self):
         try:
@@ -331,6 +437,98 @@ class RemoteDesktopServer:
         except Exception as e:
             messagebox.showerror("错误", f"设置防火墙失败: {e}\n请尝试以管理员身份运行本程序。")
 
+    def start_audio(self):
+        if not pyaudio: return
+        if self.audio_running: return
+        
+        try:
+            self.audio_p = pyaudio.PyAudio()
+            loopback = None
+            try:
+                # 1. Try PyAudioWPatch specific method
+                if hasattr(self.audio_p, 'get_default_wasapi_loopback'):
+                    loopback = self.audio_p.get_default_wasapi_loopback()
+                else:
+                    # 2. Manual search for WASAPI loopback (Fallback)
+                    wasapi_info = self.audio_p.get_host_api_info_by_type(pyaudio.paWASAPI)
+                    default_speakers = self.audio_p.get_default_output_device_info()
+                    
+                    if not default_speakers["isLoopbackDevice"]:
+                        for i in range(self.audio_p.get_device_count()):
+                            dev = self.audio_p.get_device_info_by_index(i)
+                            if dev["hostApi"] == wasapi_info["index"] and dev["name"] == default_speakers["name"]:
+                                loopback = dev
+                                break
+            except Exception as e:
+                print(f"DEBUG: Audio Device Search Error: {e}")
+                
+            if not loopback:
+                print("DEBUG: WASAPI Loopback not found. Audio disabled.")
+                return
+
+            print(f"DEBUG: Using Audio Device: {loopback['name']}")
+            
+            self.audio_config['rate'] = int(loopback['defaultSampleRate'])
+            self.audio_config['channels'] = int(loopback['maxInputChannels'])
+            
+            self.audio_stream = self.audio_p.open(
+                format=pyaudio.paInt16,
+                channels=self.audio_config['channels'],
+                rate=self.audio_config['rate'],
+                input=True,
+                input_device_index=loopback['index'],
+                frames_per_buffer=1024
+            )
+            
+            self.audio_running = True
+            self.audio_thread = threading.Thread(target=self.audio_loop, daemon=True)
+            self.audio_thread.start()
+            print(f"DEBUG: Audio Started ({self.audio_config['rate']}Hz, {self.audio_config['channels']}ch)")
+            
+        except Exception as e:
+            print(f"DEBUG: Audio Start Failed: {e}")
+            self.stop_audio()
+
+    def stop_audio(self):
+        self.audio_running = False
+        if self.audio_stream:
+            try:
+                self.audio_stream.stop_stream()
+                self.audio_stream.close()
+            except: pass
+            self.audio_stream = None
+        
+        if self.audio_p:
+            try:
+                self.audio_p.terminate()
+            except: pass
+            self.audio_p = None
+
+    def audio_loop(self):
+        while self.audio_running and self.audio_stream:
+            try:
+                data = self.audio_stream.read(1024)
+                if not data: continue
+                
+                b64_data = base64.b64encode(data).decode('utf-8')
+                msg = {'type': 'audio', 'data': b64_data}
+                
+                if self.loop and self.loop.is_running():
+                     asyncio.run_coroutine_threadsafe(self.broadcast_audio(msg), self.loop)
+                     
+            except Exception as e:
+                pass
+    
+    async def broadcast_audio(self, msg):
+        # Broadcast to all auth clients
+        # Copy keys to avoid size change during iteration
+        for ws, state in list(self.clients.items()):
+            if state.get('authenticated', False):
+                try:
+                    await ws.send_json(msg)
+                except:
+                    pass
+
     def toggle_server(self):
         if not self.running:
             self.start_server()
@@ -345,16 +543,72 @@ class RemoteDesktopServer:
         # Prevent Sleep
         prevent_system_sleep()
         
+        # Windows Priority Boost
+        if os.name == 'nt':
+            try:
+                import psutil
+                p = psutil.Process(os.getpid())
+                # HIGH_PRIORITY_CLASS = 0x00000080 (128)
+                # REALTIME_PRIORITY_CLASS = 0x00000100 (256) - Too dangerous
+                p.nice(psutil.HIGH_PRIORITY_CLASS)
+                print("DEBUG: Process Priority set to HIGH")
+            except Exception as e:
+                print(f"DEBUG: Failed to set priority: {e}")
+        
+        # Start Audio
+        self.start_audio()
+        
         # 1. Start Tunnel if enabled
         tunnel_started = False
         
         if self.use_ngrok.get():
             if self.start_ngrok():
                 tunnel_started = True
+                
+        if self.use_ssh.get():
+            self.start_ssh_tunnel()
+            tunnel_started = True
         
         # 2. Start Web Server
         self.server_thread = threading.Thread(target=self.run_async_server, daemon=True)
         self.server_thread.start()
+
+    def start_ssh_tunnel(self):
+        host = self.entry_ssh_host.get().strip()
+        user = self.entry_ssh_user.get().strip()
+        remote_port = self.entry_ssh_port.get().strip()
+        
+        if not host or not user or not remote_port:
+            messagebox.showwarning("SSH 错误", "请填写完整的 SSH 信息")
+            return
+
+        print(f"DEBUG: Starting SSH Tunnel to {user}@{host}...")
+        
+        # Command: ssh -R remote_port:localhost:local_port user@host -N
+        # -N: Do not execute a remote command (just forward)
+        # -o StrictHostKeyChecking=no: Avoid prompts
+        cmd = [
+            "ssh",
+            "-R", f"{remote_port}:127.0.0.1:{self.port}",
+            f"{user}@{host}",
+            "-N",
+            "-o", "StrictHostKeyChecking=no"
+        ]
+        
+        try:
+            # On Windows, we need to hide the console window
+            startupinfo = None
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
+            self.ssh_process = subprocess.Popen(cmd, startupinfo=startupinfo)
+            
+            # Show Info
+            messagebox.showinfo("SSH 隧道", f"隧道启动中...\n请在客户端输入: {host}:{remote_port}\n\n(注意：需要先配置好 SSH 免密登录)")
+            
+        except Exception as e:
+            messagebox.showerror("SSH 错误", f"启动 SSH 失败: {e}\n请确保系统已安装 OpenSSH 客户端")
 
     def start_ngrok(self):
         try:
@@ -374,6 +628,7 @@ class RemoteDesktopServer:
 
     def stop_server(self):
         self.running = False
+        self.stop_audio()
         self.status_dot.configure(text_color="red")
         self.status_text.configure(text=" 服务已停止", text_color="gray")
         
@@ -396,6 +651,8 @@ class RemoteDesktopServer:
         asyncio.set_event_loop(self.loop)
         
         self.app = web.Application()
+        self.app.router.add_get('/', self.handle_index)
+        self.app.router.add_static('/static', 'static')
         self.app.router.add_get('/ws', self.handle_ws)
         self.app.on_startup.append(self.on_startup)
         
@@ -405,9 +662,13 @@ class RemoteDesktopServer:
         
         try:
             self.loop.run_until_complete(self.site.start())
+            print(f"DEBUG: Server started on 0.0.0.0:{self.port}")
             self.loop.run_forever()
         except Exception as e:
             print(f"Server error: {e}")
+
+    async def handle_index(self, request):
+        return web.FileResponse('./static/index.html')
 
     async def shutdown_site(self):
         if self.site:
@@ -421,6 +682,15 @@ class RemoteDesktopServer:
         try:
             ws = web.WebSocketResponse()
             await ws.prepare(request)
+            
+            # TCP_NODELAY optimization (Disable Nagle's Algorithm)
+            # This is critical for real-time streaming to prevent packet buffering
+            if ws._writer and ws._writer.transport:
+                sock = ws._writer.transport.get_extra_info('socket')
+                if sock:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    print("DEBUG: TCP_NODELAY Enabled")
+                    
             print("DEBUG: WebSocket Handshake Successful")
             
             self.clients[ws] = {'authenticated': False}
@@ -439,9 +709,21 @@ class RemoteDesktopServer:
                                 print("DEBUG: Auth Success")
                                 self.clients[ws]['authenticated'] = True
                                 await ws.send_json({'type': 'auth_result', 'status': 'ok'})
+                                await ws.send_json({'type': 'audio_config', 'rate': self.audio_config['rate'], 'channels': self.audio_config['channels']})
+                                
+                                # Send Server Time for Sync
+                                await ws.send_json({'type': 'sync_time', 'server_time': time.time() * 1000})
+                                
+                                # Force Full Frame for new client
+                                self.force_full_frame = True
                             else:
                                 print("DEBUG: Auth Failed")
                                 await ws.send_json({'type': 'auth_result', 'status': 'error'})
+                        elif action == 'ping_sync':
+                             # Respond with server time for latency calc
+                             client_ts = data.get('client_time', 0)
+                             await ws.send_json({'type': 'pong_sync', 'client_time': client_ts, 'server_time': time.time() * 1000})
+                             
                         elif self.clients[ws]['authenticated']:
                             await self.process_command(ws, action, data)
                     except Exception as e:
@@ -479,9 +761,65 @@ class RemoteDesktopServer:
         elif action == 'file_end':
             self.finish_file_receive(ws)
             
+        elif action == 'chat':
+            msg = data.get('message', '')
+            self.root.after(0, lambda: self.append_chat("Client", msg))
+            
+        elif action == 'list_files':
+            await self.send_file_list(ws)
+            
+        elif action == 'download_request':
+            # Handle download in background task
+            asyncio.create_task(self.handle_download_request(ws, data))
+            
+        elif action == 'request_full_frame':
+            self.force_full_frame = True
+            print("DEBUG: Client requested Full Frame Refresh")
+            
         else:
             # Run mouse/keyboard in executor
             await self.loop.run_in_executor(None, self._process_command_sync, action, data, ws)
+
+    async def send_file_list(self, ws):
+        try:
+            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+            files = []
+            for f in os.listdir(desktop):
+                path = os.path.join(desktop, f)
+                if os.path.isfile(path):
+                    size = os.path.getsize(path)
+                    files.append({'name': f, 'size': size})
+            
+            await ws.send_json({'type': 'file_list', 'files': files})
+        except Exception as e:
+            print(f"List files error: {e}")
+
+    async def handle_download_request(self, ws, data):
+        filename = data.get('filename')
+        if not filename: return
+        
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        path = os.path.join(desktop, filename)
+        
+        if not os.path.exists(path): return
+        
+        try:
+            size = os.path.getsize(path)
+            await ws.send_json({'type': 'download_start', 'filename': filename, 'size': size})
+            
+            CHUNK_SIZE = 1024 * 64
+            with open(path, 'rb') as f:
+                while True:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk: break
+                    b64 = base64.b64encode(chunk).decode('utf-8')
+                    await ws.send_json({'type': 'download_chunk', 'data': b64})
+                    await asyncio.sleep(0.01) # Throttle
+            
+            await ws.send_json({'type': 'download_end', 'filename': filename})
+            print(f"DEBUG: Sent file {filename}")
+        except Exception as e:
+            print(f"Download error: {e}")
 
     def start_file_receive(self, data):
         try:
@@ -527,9 +865,20 @@ class RemoteDesktopServer:
             if action == 'mousemove':
                 # Use Percentage Coordinates (Resolution Independent)
                 if 'xp' in data and 'yp' in data:
-                    w, h = pyautogui.size()
-                    tx = int(data['xp'] * w)
-                    ty = int(data['yp'] * h)
+                    # We need to map 0.0-1.0 to the CURRENT monitor's coordinates
+                    # self.monitor_left/top/width/height are updated in the stream loop
+                    # But stream loop runs in async thread, this runs in executor. 
+                    # We should use shared variables.
+                    
+                    # Default to primary monitor/all if not set yet
+                    ml = getattr(self, 'monitor_left', 0)
+                    mt = getattr(self, 'monitor_top', 0)
+                    mw = getattr(self, 'monitor_width', pyautogui.size()[0])
+                    mh = getattr(self, 'monitor_height', pyautogui.size()[1])
+                    
+                    tx = ml + int(data['xp'] * mw)
+                    ty = mt + int(data['yp'] * mh)
+                    
                     pyautogui.moveTo(tx, ty)
                 else:
                     # Fallback for old protocol (shouldn't happen)
@@ -555,10 +904,26 @@ class RemoteDesktopServer:
             elif action == 'scroll':
                 pyautogui.scroll(data.get('dy', 0))
             elif action == 'clipboard_set':
-                pyperclip.copy(data.get('text', ''))
+                try:
+                    text = data.get('text', '')
+                    pyperclip.copy(text)
+                    print(f"DEBUG: Clipboard set to: {text[:20]}...")
+                except Exception as e:
+                    print(f"DEBUG: Clipboard set error: {e}")
             elif action == 'clipboard_get':
-                # This needs to be async sent back, but we are in sync thread
-                # We can schedule it back to loop
+                # Check for Image first
+                try:
+                    img = ImageGrab.grabclipboard()
+                    if isinstance(img, Image.Image):
+                        buffer = io.BytesIO()
+                        img.save(buffer, format='PNG')
+                        b64_data = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                        asyncio.run_coroutine_threadsafe(ws.send_json({'type': 'clipboard_image', 'data': b64_data}), self.loop)
+                        return
+                except:
+                    pass
+                
+                # Fallback to text
                 text = pyperclip.paste()
                 asyncio.run_coroutine_threadsafe(ws.send_json({'type': 'clipboard_text', 'text': text}), self.loop)
             elif action == 'type_text':
@@ -566,112 +931,208 @@ class RemoteDesktopServer:
         except Exception as e:
             print(f"DEBUG: Input error: {e}")
 
-    async def stream_screen(self, app):
-        print("DEBUG: Starting screen stream task...")
-        try:
-            sct = mss.mss()
-            print(f"DEBUG: MSS Monitors found: {len(sct.monitors)}")
-            
-            # Use Primary Monitor (Index 1) for reliable coordinate mapping
-            # Monitor 0 (All) can cause scaling issues if multi-monitor
-            if len(sct.monitors) > 1:
-                # Use selected monitor index
-                # Ensure index is valid
-                idx = self.monitor_index
-                if idx == 0: # Auto/Primary
-                     monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-                elif idx < len(sct.monitors):
-                     monitor = sct.monitors[idx]
-                else:
-                     monitor = sct.monitors[1] # Fallback
-            else:
-                monitor = sct.monitors[0]
+    def _capture_frame_sync(self, monitor, target_res, use_grayscale, jpeg_quality, prev_img_ref=None):
+        # Create new MSS instance for this thread
+        import mss
+        from PIL import ImageChops
+        
+        with mss.mss() as sct:
+            try:
+                sct_img = sct.grab(monitor)
+                if not sct_img: return None
                 
-            print(f"DEBUG: Using monitor: {monitor}")
-            
-            # Calculate Scaling Factor (Logical Points vs Physical Pixels)
-            w_log, h_log = pyautogui.size()
-            w_phy = monitor['width']
-            h_phy = monitor['height']
-            
-            self.scale_x = w_log / w_phy
-            self.scale_y = h_log / h_phy
-            self.monitor_left = monitor['left']
-            self.monitor_top = monitor['top']
-            
-            print(f"DEBUG: Screen Scale Factor: X={self.scale_x:.2f}, Y={self.scale_y:.2f}")
-            print(f"DEBUG: Screen Offset: Left={self.monitor_left}, Top={self.monitor_top}")
-            
+                img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                
+                # Resize (Must be consistent for diff)
+                if target_res:
+                    img.thumbnail(target_res, Image.Resampling.LANCZOS)
+
+                # Grayscale
+                if use_grayscale:
+                    img = img.convert('L')
+                
+                # Differential Update Logic
+                diff_box = None
+                full_update = True
+                
+                # We need persistent state for 'prev_img', but we are in a thread pool...
+                # We can use a thread-safe dict passed as ref, or just return full frame if complex.
+                # Actually, 'prev_img_ref' is a list [prev_image_obj] passed from main loop.
+                # Since we run tasks sequentially (mostly), we might get away with it.
+                # But wait, run_in_executor runs in parallel if max_workers > 1.
+                # For safety, let's just do full frames first, then optimize.
+                # ToDesk uses H.264 P-frames which is diff by definition.
+                # Implementing ImageChops.difference here:
+                
+                if prev_img_ref and prev_img_ref[0]:
+                    prev_img = prev_img_ref[0]
+                    if prev_img.size == img.size and prev_img.mode == img.mode:
+                        # Compute diff
+                        diff = ImageChops.difference(img, prev_img)
+                        bbox = diff.getbbox()
+                        if bbox:
+                            # Verify if diff is large enough to matter
+                            # If diff is tiny, skip? No, even tiny updates matter (typing).
+                            # If diff is HUGE (whole screen), send full frame.
+                            
+                            # Expand bbox slightly to avoid artifacts at edges?
+                            # Let's just crop.
+                            diff_box = bbox
+                            full_update = False
+                            
+                            # Update reference
+                            prev_img_ref[0] = img
+                        else:
+                            # No change
+                            return b'NO_CHANGE'
+                
+                if full_update:
+                    prev_img_ref[0] = img
+                    
+                buffer = io.BytesIO()
+                
+                if not full_update and diff_box:
+                    # Send partial
+                    crop = img.crop(diff_box)
+                    crop.save(buffer, format="JPEG", quality=jpeg_quality)
+                    
+                    # Protocol: [8b ts] + [1b type] + [4b x] + [4b y] + [4b w] + [4b h] + [data]
+                    # Type: 0=Full, 1=Partial
+                    # We need to return a dict or structured object to main loop
+                    return {
+                        'type': 'partial',
+                        'x': diff_box[0], 'y': diff_box[1],
+                        'w': diff_box[2] - diff_box[0],
+                        'h': diff_box[3] - diff_box[1],
+                        'data': buffer.getvalue()
+                    }
+                else:
+                    img.save(buffer, format="JPEG", quality=jpeg_quality)
+                    return {
+                        'type': 'full',
+                        'data': buffer.getvalue()
+                    }
+
+            except Exception as e:
+                print(f"Capture error: {e}")
+                return None
+
+    async def stream_screen(self, app):
+        print("DEBUG: Stream Loop Started (Threaded)")
+        import mss
+        try:
+            # Main thread instance for monitor info only
+            main_sct = mss.mss()
         except Exception as e:
             print(f"DEBUG: Failed to init MSS: {e}")
             return
 
+        # Initial Monitor Setup
+        monitor = main_sct.monitors[0]
+        if len(main_sct.monitors) > 1:
+             monitor = main_sct.monitors[1]
+             
+        self.monitor_left = monitor['left']
+        self.monitor_top = monitor['top']
+        self.monitor_width = monitor['width']
+        self.monitor_height = monitor['height']
+        
         frame_count = 0
+        current_monitor_idx = -1 
+        
+        # Thread Pool for Capture/Encode
+        import concurrent.futures
+        # MUST use max_workers=1 to ensure sequential diffs against 'prev_img'
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        
+        # State for Diff
+        prev_img_ref = [None] 
+        
         while True:
+            start_time = time.time()
+            
             # Check for monitor update
-            if self.monitor_index != 0:
+            if self.monitor_index != current_monitor_idx:
                 try:
-                    if self.monitor_index < len(sct.monitors):
-                         monitor = sct.monitors[self.monitor_index]
-                         # Update scaling if monitor changed
-                         w_phy = monitor['width']
-                         h_phy = monitor['height']
-                         self.scale_x = w_log / w_phy
-                         self.scale_y = h_log / h_phy
-                         self.monitor_left = monitor['left']
-                         self.monitor_top = monitor['top']
-                except:
-                    pass
+                    current_monitor_idx = self.monitor_index
+                    if current_monitor_idx < len(main_sct.monitors):
+                        monitor = main_sct.monitors[current_monitor_idx]
+                    else:
+                        monitor = main_sct.monitors[1] if len(main_sct.monitors) > 1 else main_sct.monitors[0]
+                        
+                    self.monitor_left = monitor['left']
+                    self.monitor_top = monitor['top']
+                    self.monitor_width = monitor['width']
+                    self.monitor_height = monitor['height']
+                    print(f"DEBUG: Switched to Monitor {current_monitor_idx}")
+                    # Reset diff reference on monitor switch
+                    prev_img_ref[0] = None
+                except Exception:
+                    monitor = main_sct.monitors[0]
 
             auth_clients = [ws for ws, state in self.clients.items() if state['authenticated']]
+            
             if not auth_clients:
                 await asyncio.sleep(0.2)
                 continue
             
-            # Rate Control
-            start_time = time.time()
+            # Check if we need to force a full frame (e.g. new client connected)
+            if self.force_full_frame:
+                print("DEBUG: Forcing Full Frame Update")
+                prev_img_ref[0] = None
+                self.force_full_frame = False
+            
+            # Offload heavy lifting to thread pool
+            target_res = self.target_res
+            use_gray = self.use_grayscale.get()
+            quality = self.jpeg_quality
             
             try:
-                sct_img = sct.grab(monitor)
-                img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                # Don't pass 'sct' instance, create new one in thread
+                result = await self.loop.run_in_executor(
+                    pool, 
+                    self._capture_frame_sync, 
+                    monitor, target_res, use_gray, quality, prev_img_ref
+                )
                 
-                # Removed Red Dot Drawing Code as requested
-
-                # Resize
-                if self.target_res:
-                    img.thumbnail(self.target_res, Image.Resampling.LANCZOS)
-
-                # Grayscale Conversion
-                if self.use_grayscale.get():
-                    img = img.convert('L')
-
-                buffer = io.BytesIO()
-                img.save(buffer, format="JPEG", quality=self.jpeg_quality)
-                img_str = base64.b64encode(buffer.getvalue()).decode('utf-8')
-                
-                # Include Timestamp for Latency Check
-                msg = {
-                    'type': 'frame', 
-                    'data': img_str,
-                    'ts': time.time() * 1000 # ms
-                }
-                
-                for ws in auth_clients:
-                    try:
-                        await ws.send_json(msg)
-                    except Exception as e:
-                        print(f"DEBUG: Failed to send frame to client: {e}")
-                
-                frame_count += 1
-                if frame_count % 15 == 0: # Print every ~1 second at 15fps
-                    print(f"DEBUG: [Heartbeat] Sent frame {frame_count}. Target FPS: {self.target_fps}")
+                if result == b'NO_CHANGE':
+                    await asyncio.sleep(0.01)
+                    continue
                     
-            except Exception as e:
-                print(f"DEBUG: Screen capture error: {e}")
-                import traceback
-                traceback.print_exc()
-                await asyncio.sleep(1)
+                if result:
+                    ts = time.time() * 1000 # ms
+                    import struct
+                    
+                    if isinstance(result, dict):
+                        if result['type'] == 'full':
+                            # Protocol V2: [8b ts] + [1b type=0] + [Data]
+                            header = struct.pack('>dB', ts, 0)
+                            payload = header + result['data']
+                        elif result['type'] == 'partial':
+                            # Protocol V2: [8b ts] + [1b type=1] + [2b x] + [2b y] + [2b w] + [2b h] + [Data]
+                            # Use Short (H) for coords (0-65535)
+                            header = struct.pack('>dBHHHH', ts, 1, 
+                                                 result['x'], result['y'], result['w'], result['h'])
+                            payload = header + result['data']
+                    else:
+                        # Legacy Fallback (Shouldn't reach here with new code)
+                        header = struct.pack('>d', ts)
+                        payload = header + result
+                    
+                    # Broadcast
+                    for ws in auth_clients:
+                        try:
+                            await ws.send_bytes(payload)
+                        except: pass
+                    
+                    frame_count += 1
+                    if frame_count % 60 == 0: 
+                        print(f"DEBUG: [Heartbeat] Sent frame {frame_count}. FPS Target: {self.target_fps}")
             
+            except Exception as e:
+                print(f"Stream loop error: {e}")
+                await asyncio.sleep(1)
+
             # FPS Control
             elapsed = time.time() - start_time
             target_delay = 1.0 / self.target_fps

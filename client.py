@@ -11,6 +11,15 @@ from tkinter import simpledialog, messagebox
 from PIL import Image, ImageTk
 import aiohttp
 import pyperclip
+import tempfile
+import subprocess
+import os
+
+try:
+    import pyaudio
+except ImportError:
+    pyaudio = None
+    print("Warning: PyAudio not found. Sound will be disabled.")
 
 # Configuration
 DEFAULT_PORT = 8080
@@ -28,6 +37,25 @@ class RemoteDesktopClient:
         self.running = False
         self.host = ""
         self.password = ""
+        
+        # Smart Mode State
+        self.auto_quality = False
+        self.current_latency = 0
+        self.bytes_since_check = 0
+        self.last_check_time = time.time()
+        
+        # Audio
+        self.audio_p = None
+        self.audio_stream = None
+        self.audio_enabled = tk.BooleanVar(value=True) # Default On
+        if pyaudio:
+            try:
+                self.audio_p = pyaudio.PyAudio()
+            except Exception as e:
+                print(f"Audio init failed: {e}")
+        
+        # Clock Sync
+        self.time_offset = 0 # server_time - client_time
         
         # Setup Login UI
         self.setup_login_ui()
@@ -213,6 +241,8 @@ class RemoteDesktopClient:
                                 # Auth Success! Switch to Desktop UI
                                 print("DEBUG: Auth OK! Switching UI...")
                                 self.root.after(0, self.switch_to_desktop_ui)
+                                # Start Clock Sync
+                                asyncio.create_task(self.sync_clock())
                                 # Start listening loop
                                 print("DEBUG: Starting Listen Loop...")
                                 await self.listen_loop(ws)
@@ -221,6 +251,9 @@ class RemoteDesktopClient:
                                 self.root.after(0, lambda: messagebox.showerror("验证失败", "密码错误"))
                                 self.root.after(0, self.reset_login_ui)
                                 return
+                    elif msg.type == aiohttp.WSMsgType.BINARY:
+                        pass # Ignore binary during auth phase
+                        
                     elif msg.type == aiohttp.WSMsgType.CLOSED:
                          print("DEBUG: Connection Closed during Auth")
                          self.root.after(0, lambda: messagebox.showerror("连接断开", "服务器拒绝了连接"))
@@ -276,6 +309,55 @@ class RemoteDesktopClient:
                     # print(f"DEBUG: Received Msg: {msg.data[:50]}...") # Too verbose for frames
                     data = json.loads(msg.data)
                     await self.handle_message(data)
+                
+                elif msg.type == aiohttp.WSMsgType.BINARY:
+                    # Optimized Binary Frame Protocol
+                    try:
+                        data = msg.data
+                        if len(data) > 9: # At least 9 bytes (ts + type)
+                            import struct
+                            # Peek Type
+                            frame_type = data[8]
+                            
+                            if frame_type == 0: # Full Frame
+                                ts = struct.unpack('>d', data[:8])[0]
+                                img_bytes = data[9:]
+                                
+                                # Render Full (Thread Safe)
+                                try:
+                                    image = Image.open(io.BytesIO(img_bytes))
+                                    # Must use root.after to schedule GUI update on main thread!
+                                    self.root.after(0, self.update_image_safe, image)
+                                except Exception as e:
+                                    print(f"Full Frame Error: {e}")
+                                
+                            elif frame_type == 1: # Partial Frame
+                                # [8b ts] + [1b type] + [2b x] + [2b y] + [2b w] + [2b h] + [data]
+                                if len(data) > 17:
+                                    ts, _, x, y, w, h = struct.unpack('>dBHHHH', data[:17])
+                                    img_bytes = data[17:]
+                                    
+                                    # Render Partial (Thread Safe)
+                                    try:
+                                        patch = Image.open(io.BytesIO(img_bytes))
+                                        # Schedule on main thread
+                                        self.root.after(0, self.update_partial_safe, patch, x, y)
+                                    except Exception as e:
+                                        print(f"Partial render error: {e}")
+                            
+                            # Common Latency Calc
+                            if 'ts' in locals():
+                                self.frame_count += 1
+                                now = time.time() * 1000
+                                latency = int(now - (ts - self.time_offset))
+                                if latency < 0: latency = 0 
+                                self.current_latency = latency
+                                self.root.after(0, self.update_latency_display, latency)
+
+                    except Exception as e:
+                        print(f"Decode Error: {e}")
+                        pass
+
                 elif msg.type == aiohttp.WSMsgType.CLOSED:
                     print("DEBUG: WS Closed")
                     break
@@ -319,8 +401,13 @@ class RemoteDesktopClient:
         self.fps_label = tk.Label(self.root, text="FPS: 0", bg="black", fg="#00FFFF", font=("Arial", 10))
         self.fps_label.place(relx=0.0, rely=0.0, anchor=tk.NW, x=10, y=10)
         
+        # Speed Label
+        self.speed_label = tk.Label(self.root, text="Speed: 0 KB/s", bg="black", fg="#FF00FF", font=("Arial", 10))
+        self.speed_label.place(relx=0.0, rely=0.0, anchor=tk.NW, x=80, y=10)
+        
         self.frame_count = 0
         self.start_fps_timer()
+        self.start_network_monitor()
         
         # Menu
         self.menu_bar = tk.Menu(self.root)
@@ -333,11 +420,18 @@ class RemoteDesktopClient:
         # Quality
         self.quality_menu = tk.Menu(self.settings_menu, tearoff=0)
         self.settings_menu.add_cascade(label="画质", menu=self.quality_menu)
+        self.quality_menu.add_command(label="自动 (智能领航)", command=lambda: self.set_auto_quality(True))
+        self.quality_menu.add_separator()
         self.quality_menu.add_command(label="高清 (80%)", command=lambda: self.update_remote_settings(quality=80))
         self.quality_menu.add_command(label="平衡 (50%)", command=lambda: self.update_remote_settings(quality=50))
         self.quality_menu.add_command(label="流畅 (30%)", command=lambda: self.update_remote_settings(quality=30))
         self.quality_menu.add_command(label="极速 (10%)", command=lambda: self.update_remote_settings(quality=10))
         
+        # View
+        self.view_menu = tk.Menu(self.settings_menu, tearoff=0)
+        self.menu_bar.add_cascade(label="视图", menu=self.view_menu)
+        self.view_menu.add_command(label="全屏模式 (Esc退出)", command=self.toggle_fullscreen)
+
         # FPS
         self.fps_menu = tk.Menu(self.settings_menu, tearoff=0)
         self.settings_menu.add_cascade(label="帧率", menu=self.fps_menu)
@@ -349,14 +443,20 @@ class RemoteDesktopClient:
         # Monitor
         self.monitor_menu = tk.Menu(self.settings_menu, tearoff=0)
         self.settings_menu.add_cascade(label="切换屏幕", menu=self.monitor_menu)
+        self.monitor_menu.add_command(label="全部屏幕 (监控墙)", command=lambda: self.update_remote_settings(monitor=0))
+        self.monitor_menu.add_separator()
         self.monitor_menu.add_command(label="屏幕 1", command=lambda: self.update_remote_settings(monitor=1))
         self.monitor_menu.add_command(label="屏幕 2", command=lambda: self.update_remote_settings(monitor=2))
         self.monitor_menu.add_command(label="屏幕 3", command=lambda: self.update_remote_settings(monitor=3))
+
+        # Audio Toggle
+        self.settings_menu.add_checkbutton(label="启用声音", onvalue=True, offvalue=False, variable=self.audio_enabled)
 
         # 2. File Menu
         self.file_menu = tk.Menu(self.menu_bar, tearoff=0)
         self.menu_bar.add_cascade(label="文件", menu=self.file_menu)
         self.file_menu.add_command(label="发送文件到远程...", command=self.upload_file)
+        self.file_menu.add_command(label="从远程下载文件...", command=self.request_file_list)
 
         # 3. Clipboard Menu
         self.clipboard_menu = tk.Menu(self.menu_bar, tearoff=0)
@@ -368,7 +468,14 @@ class RemoteDesktopClient:
         self.canvas.bind('<Motion>', self.on_mouse_move)
         self.canvas.bind('<Button-1>', lambda e: self.on_mouse_click(e, 'left', 'mousedown'))
         self.canvas.bind('<ButtonRelease-1>', lambda e: self.on_mouse_click(e, 'left', 'mouseup'))
+
+        # Chat Button (Overlay)
+        self.btn_chat = tk.Button(self.root, text="💬", bg="black", fg="white", font=("Arial", 16), command=self.toggle_chat, borderwidth=0)
+        self.btn_chat.place(relx=1.0, rely=1.0, anchor=tk.SE, x=-20, y=-20)
         
+        # Chat Window (Hidden by default)
+        self.chat_window = None
+
         # Mac often maps Button-2 to Right Click, Button-3 to Middle or Right depending on mouse
         if sys.platform == 'darwin':
             self.canvas.bind('<Button-2>', lambda e: self.on_mouse_click(e, 'right', 'mousedown'))
@@ -397,6 +504,225 @@ class RemoteDesktopClient:
         # Mouse Throttling
         self.last_mouse_time = 0
         self.mouse_interval = 0.05 # 50ms = 20 FPS cap for mouse events
+        
+        # Fullscreen State
+        self.is_fullscreen = False
+
+    def toggle_fullscreen(self, event=None):
+        self.is_fullscreen = not self.is_fullscreen
+        self.root.attributes("-fullscreen", self.is_fullscreen)
+        if self.is_fullscreen:
+            self.root.bind("<Escape>", self.toggle_fullscreen)
+        else:
+            self.root.unbind("<Escape>")
+
+    def set_auto_quality(self, enabled):
+        self.auto_quality = enabled
+        if enabled:
+            messagebox.showinfo("智能模式", "已开启智能画质调节\n系统将根据网络延迟自动调整画质与帧率。")
+        else:
+            messagebox.showinfo("智能模式", "已关闭智能画质调节")
+
+    def start_network_monitor(self):
+        """Smart Adaptive Engine: Adjusts quality based on latency"""
+        def _monitor_loop():
+            if not self.running: return
+            
+            if self.auto_quality and self.frame_count > 0: # Only adjust if receiving frames
+                # Simple Adaptive Logic
+                # High Latency (>200ms) -> Low Quality, Low FPS
+                # Medium Latency (100-200ms) -> Medium Quality
+                # Low Latency (<50ms) -> High Quality, High FPS
+                
+                # We use a weighted average or just current snapshot
+                current = self.current_latency
+                
+                # We need to send updates only if state changes significantly to avoid flooding
+                # But for now, let's just log or implement a simple hysteresis
+                
+                new_quality = None
+                new_fps = None
+                
+                if current > 300:
+                    new_quality = 10
+                    new_fps = 5
+                elif current > 150:
+                    new_quality = 30
+                    new_fps = 15
+                elif current > 80:
+                    new_quality = 50
+                    new_fps = 30
+                elif current < 40:
+                    new_quality = 80
+                    new_fps = 60
+                    
+                # Send update if we have a decision
+                if new_quality:
+                    # We can optimize by storing last sent values and only sending diffs
+                    # For now, just fire and forget (server handles it efficiently)
+                    asyncio.run_coroutine_threadsafe(
+                        self.update_remote_settings_async(quality=new_quality, fps=new_fps),
+                        self.loop
+                    )
+            
+            self.root.after(2000, _monitor_loop) # Check every 2 seconds
+            
+        _monitor_loop()
+
+    async def update_remote_settings_async(self, quality=None, fps=None, monitor=None):
+        if not self.ws: return
+        payload = {'action': 'update_settings'}
+        if quality is not None: payload['quality'] = quality
+        if fps is not None: payload['fps'] = fps
+        if monitor is not None: payload['monitor'] = monitor
+        try:
+            await self.ws.send_json(payload)
+        except: pass
+
+    def update_image_safe(self, image):
+        try:
+            self.current_image_obj = image # Keep reference
+            
+            # Scale if needed (Fit to window)
+            win_w = self.canvas.winfo_width()
+            win_h = self.canvas.winfo_height()
+            
+            # Only scale if window is valid
+            if win_w > 1 and win_h > 1:
+                # Aspect Ratio
+                img_w, img_h = image.size
+                ratio = min(win_w / img_w, win_h / img_h)
+                new_w = int(img_w * ratio)
+                new_h = int(img_h * ratio)
+                
+                self.scale_x = new_w / img_w
+                self.scale_y = new_h / img_h
+                self.img_w = new_w
+                self.img_h = new_h
+                
+                image = image.resize((new_w, new_h), Image.Resampling.NEAREST) # Nearest is fast
+                
+            self.tk_image = ImageTk.PhotoImage(image)
+            self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_image)
+        except Exception as e:
+            print(f"Render Error: {e}")
+
+    def update_partial_safe(self, patch, x, y):
+        try:
+            # We need to paste 'patch' onto 'self.current_image_obj' at (x,y)
+            # Then redraw. This seems inefficient to re-scale the whole thing?
+            # Ideally, we should scale the PATCH and draw it on Canvas directly?
+            # But scaling coordinates is tricky if aspect ratio changes.
+            # Best way: Maintain a master "virtual framebuffer" (full resolution) in memory.
+            # Apply patches to that.
+            # Then scale THAT to window size and render.
+            
+            if not hasattr(self, 'current_image_obj') or not self.current_image_obj:
+                print("DEBUG WARNING: Received partial frame but no base image! Requesting Full Frame...")
+                # Request full frame immediately
+                if self.loop:
+                    asyncio.run_coroutine_threadsafe(
+                        self.ws.send_json({'action': 'request_full_frame'}),
+                        self.loop
+                    )
+                return # Can't patch nothing
+                
+            # 1. Update Master Framebuffer
+            self.current_image_obj.paste(patch, (x, y))
+            
+            # 2. Render (Full refresh for now, optimization: only redraw dirty region on canvas?)
+            # Since we resize for window fit, we have to resize the whole thing usually.
+            # Unless we are 1:1.
+            self.update_image_safe(self.current_image_obj)
+            
+        except Exception as e:
+            print(f"Partial Update Error: {e}")
+
+    def toggle_chat(self):
+        if self.chat_window and self.chat_window.winfo_exists():
+            self.chat_window.destroy()
+            self.chat_window = None
+            return
+            
+        self.chat_window = tk.Toplevel(self.root)
+        self.chat_window.title("聊天")
+        self.chat_window.geometry("300x400")
+        self.chat_window.attributes("-topmost", True)
+        
+        # History
+        self.chat_history = tk.Text(self.chat_window, state="disabled")
+        self.chat_history.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        # Input
+        input_frame = tk.Frame(self.chat_window)
+        input_frame.pack(fill="x", padx=5, pady=5)
+        
+        self.chat_entry = tk.Entry(input_frame)
+        self.chat_entry.pack(side="left", fill="x", expand=True)
+        self.chat_entry.bind("<Return>", lambda e: self.send_chat())
+        
+        btn_send = tk.Button(input_frame, text="发送", command=self.send_chat)
+        btn_send.pack(side="right", padx=(5, 0))
+
+    def send_chat(self):
+        text = self.chat_entry.get().strip()
+        if not text: return
+        
+        self.chat_entry.delete(0, tk.END)
+        self.append_chat("我", text)
+        
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(self.ws.send_json({'action': 'chat', 'message': text}), self.loop)
+
+    def append_chat(self, sender, text):
+        if not self.chat_window or not self.chat_window.winfo_exists():
+            # If closed, maybe flash button?
+            return
+            
+        self.chat_history.configure(state="normal")
+        self.chat_history.insert(tk.END, f"[{sender}]: {text}\n")
+        self.chat_history.see(tk.END)
+        self.chat_history.configure(state="disabled")
+
+    def request_file_list(self):
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(self.ws.send_json({'action': 'list_files'}), self.loop)
+            
+    def show_file_list(self, files):
+        win = tk.Toplevel(self.root)
+        win.title("远程文件列表 (桌面)")
+        win.geometry("400x500")
+        
+        listbox = tk.Listbox(win)
+        listbox.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        for f in files:
+            size_mb = f['size'] / 1024 / 1024
+            listbox.insert(tk.END, f"{f['name']} ({size_mb:.2f} MB)")
+            
+        def _download():
+            sel = listbox.curselection()
+            if not sel: return
+            index = sel[0]
+            filename = files[index]['name']
+            
+            # Start Download
+            if self.loop:
+                asyncio.run_coroutine_threadsafe(
+                    self.ws.send_json({'action': 'download_request', 'filename': filename}),
+                    self.loop
+                )
+            win.destroy()
+            messagebox.showinfo("下载", f"开始下载 {filename}...\n文件将保存到当前目录。")
+            
+        btn = tk.Button(win, text="下载选中文件", command=_download)
+        btn.pack(pady=10)
+
+    def update_latency_display(self, latency):
+        self.latency_label.config(text=f"延迟: {latency} ms")
+        if latency < 50: self.latency_label.config(fg="#00FF00")
+        elif latency < 150: self.latency_label.config(fg="#FFFF00")
+        else: self.latency_label.config(fg="#FF0000")
 
     def start_fps_timer(self):
         def _update_fps():
@@ -406,20 +732,77 @@ class RemoteDesktopClient:
             self.root.after(1000, _update_fps)
         _update_fps()
 
+    async def sync_clock(self):
+        """Perform simple NTP-like clock synchronization"""
+        print("DEBUG: Starting Clock Sync...")
+        # Average over 5 samples
+        offsets = []
+        for _ in range(5):
+            try:
+                t1 = time.time() * 1000
+                await self.ws.send_json({'action': 'ping_sync', 'client_time': t1})
+                await asyncio.sleep(0.5)
+            except: break
+            
     async def handle_message(self, data):
         msg_type = data.get('type')
         
-        if msg_type == 'frame':
+        if msg_type == 'pong_sync':
+            t1 = data.get('client_time', 0)
+            server_ts = data.get('server_time', 0)
+            t2 = time.time() * 1000
+            
+            rtt = t2 - t1
+            # Offset = Server - Client
+            # server_ts is approx at t1 + rtt/2
+            offset = server_ts - (t1 + rtt/2)
+            
+            # Update offset (using simple moving average or just last value)
+            # For simplicity, we just use the latest valid one, maybe average later if needed
+            self.time_offset = offset
+            print(f"DEBUG: Clock Synced. RTT={rtt:.1f}ms, Offset={offset:.1f}ms")
+
+        elif msg_type == 'frame':
             self.frame_count += 1
             # Calculate Latency
             if 'ts' in data:
                 latency = int((time.time() * 1000) - data['ts'])
-                self.update_latency_display(latency)
+                self.current_latency = latency # Update for Smart Engine
+                self.root.after(0, self.update_latency_display, latency)
             
             img_data = base64.b64decode(data['data'])
             image = Image.open(io.BytesIO(img_data))
-            self.update_image_safe(image)
+            self.root.after(0, self.update_image_safe, image)
             
+        elif msg_type == 'clipboard_image':
+            try:
+                b64_data = data.get('data')
+                img_data = base64.b64decode(b64_data)
+                
+                # Save to temp file
+                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+                    f.write(img_data)
+                    temp_path = f.name
+                
+                # Use osascript to set clipboard on Mac
+                if sys.platform == 'darwin':
+                    # AppleScript to set clipboard to image file
+                    cmd = f'set the clipboard to (read (POSIX file "{temp_path}") as JPEG picture)'
+                    subprocess.run(['osascript', '-e', cmd])
+                else:
+                    # Windows/Linux (Partial support, Pyperclip doesn't do images)
+                    # For Windows, we could use win32clipboard if available, but client is Mac in this env.
+                    messagebox.showinfo("提示", "图片已接收，但当前系统暂不支持直接写入剪贴板。\n已保存到临时文件: " + temp_path)
+                    
+                self.root.after(0, lambda: messagebox.showinfo("剪贴板", "远程图片已复制到本地剪贴板！"))
+                
+                # Cleanup temp file? If we delete it too fast, clipboard might lose reference on some OS
+                # Better to leave it or delete on exit.
+                
+            except Exception as e:
+                print(f"Clipboard Image Error: {e}")
+                self.root.after(0, lambda: messagebox.showerror("错误", f"剪贴板图片接收失败: {e}"))
+
         elif msg_type == 'clipboard_text':
             text = data.get('text', '')
             self.root.after(0, lambda: pyperclip.copy(text))
@@ -430,15 +813,72 @@ class RemoteDesktopClient:
             msg = data.get('message', '')
             self.root.after(0, lambda: messagebox.showinfo(title, msg))
 
-    def update_remote_settings(self, quality=None, fps=None, monitor=None):
-        payload = {'action': 'update_settings'}
-        if quality is not None: payload['quality'] = quality
-        if fps is not None: payload['fps'] = fps
-        if monitor is not None: payload['monitor'] = monitor
+        elif msg_type == 'chat':
+            sender = data.get('sender', 'Unknown')
+            msg = data.get('message', '')
+            # If window not open, show notification or small indicator
+            if not self.chat_window or not self.chat_window.winfo_exists():
+                self.btn_chat.config(bg="red") # Flash red
+            
+            self.append_chat(sender, msg)
+            
+        elif msg_type == 'file_list':
+            files = data.get('files', [])
+            self.root.after(0, lambda: self.show_file_list(files))
+            
+        elif msg_type == 'download_start':
+            self.download_filename = data.get('filename')
+            self.download_size = data.get('size')
+            self.download_handle = open(self.download_filename, 'wb')
+            print(f"DEBUG: Starting download {self.download_filename}")
+            
+        elif msg_type == 'download_chunk':
+            if getattr(self, 'download_handle', None):
+                chunk = base64.b64decode(data['data'])
+                self.download_handle.write(chunk)
         
-        self.send_json(payload)
-        # Feedback
-        print(f"DEBUG: Sent Settings Update: {payload}")
+        elif msg_type == 'download_end':
+            if getattr(self, 'download_handle', None):
+                self.download_handle.close()
+                self.download_handle = None
+                filename = data.get('filename')
+                self.root.after(0, lambda: messagebox.showinfo("下载完成", f"文件 {filename} 已保存"))
+
+        elif msg_type == 'audio_config':
+            if not self.audio_p: return
+            rate = data.get('rate', 48000)
+            channels = data.get('channels', 2)
+            
+            if self.audio_stream:
+                try:
+                    self.audio_stream.stop_stream()
+                    self.audio_stream.close()
+                except: pass
+            
+            try:
+                self.audio_stream = self.audio_p.open(
+                    format=pyaudio.paInt16,
+                    channels=channels,
+                    rate=rate,
+                    output=True
+                )
+                print(f"DEBUG: Audio Output Started ({rate}Hz, {channels}ch)")
+            except Exception as e:
+                print(f"DEBUG: Audio Output Init Failed: {e}")
+
+        elif msg_type == 'audio':
+            if self.audio_stream and self.audio_enabled.get():
+                try:
+                    raw_data = base64.b64decode(data['data'])
+                    self.audio_stream.write(raw_data)
+                except: pass
+
+    def update_remote_settings(self, quality=None, fps=None, monitor=None):
+        if not self.loop: return
+        asyncio.run_coroutine_threadsafe(
+            self.update_remote_settings_async(quality, fps, monitor),
+            self.loop
+        )
 
     def upload_file(self):
         from tkinter import filedialog
@@ -596,22 +1036,56 @@ class RemoteDesktopClient:
         if 'shift' in key: return 'shift'
         if 'control' in key: return 'ctrl'
         if 'alt' in key: return 'alt'
-        if 'meta' in key or 'win' in key: return 'command'
+        
+        # Mac Command -> Windows Ctrl Mapping
+        if 'meta' in key or 'win' in key or 'command' in key: 
+            return 'ctrl'
         
         if len(key) == 1: return key
         return key
 
-    # --- Features ---
     def send_clipboard(self):
+        # 1. Try Image First
+        # Note: On Mac, GrabClipboard might fail if not focused or no image
+        try:
+            img = ImageGrab.grabclipboard()
+            if isinstance(img, Image.Image):
+                buffer = io.BytesIO()
+                img.save(buffer, format='PNG')
+                b64_data = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                self.update_remote_settings() # Dummy call to get loop? No, use loop directly
+                if self.loop:
+                    asyncio.run_coroutine_threadsafe(
+                        self.ws.send_json({'action': 'clipboard_image', 'data': b64_data}),
+                        self.loop
+                    )
+                messagebox.showinfo("成功", "图片已发送到远程剪贴板！")
+                return
+        except Exception as e:
+            # print(f"Clipboard Image Error: {e}")
+            pass
+            
+        # 2. Fallback to Text
         try:
             text = pyperclip.paste()
-            self.send_json({'action': 'clipboard_set', 'text': text})
-            messagebox.showinfo("剪贴板", "本地剪贴板已发送到远程！")
+            if text:
+                if self.loop:
+                    asyncio.run_coroutine_threadsafe(
+                        self.ws.send_json({'action': 'clipboard_set', 'text': text}),
+                        self.loop
+                    )
+                messagebox.showinfo("成功", "文本已发送到远程剪贴板！")
+            else:
+                messagebox.showwarning("剪贴板", "剪贴板为空")
         except Exception as e:
             messagebox.showerror("错误", f"剪贴板错误: {e}")
 
     def get_clipboard(self):
-        self.send_json({'action': 'clipboard_get'})
+        if self.loop:
+             asyncio.run_coroutine_threadsafe(
+                self.ws.send_json({'action': 'clipboard_get'}),
+                self.loop
+             )
 
     def on_close(self, event=None):
         self.running = False
