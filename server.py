@@ -127,10 +127,13 @@ class RemoteDesktopServer:
         self.port = 8080
         self.ip = self.get_local_ip()
         self.public_url = None
+        self.device_id = self.generate_device_id()
+        self.signal_server_url = "http://localhost:9000" # Local simulation of public server
         self.running = False
         self.loop = None
         self.server_thread = None
         self.ngrok_token = ""
+        self.use_tunnel = None # Initialized in UI (CTk variable needs root)
         
         # Coordinate Scaling
         self.scale_x = 1.0
@@ -206,6 +209,9 @@ class RemoteDesktopServer:
         # IPv4
         self.create_info_row(self.conn_frame, "本机局域网 IP:", self.ip)
         
+        # Device ID (New)
+        self.create_info_row(self.conn_frame, "设备 ID (公网):", self.device_id)
+        
         # PgyVPN
         pgy_ip = self.get_pgy_ip()
         self.pgy_val = self.create_info_row(self.conn_frame, "蒲公英虚拟 IP:", pgy_ip if pgy_ip else "未检测到")
@@ -257,6 +263,13 @@ class RemoteDesktopServer:
         self.chk_gray = ctk.CTkSwitch(self.settings_frame, text="黑白模式 (极速)", variable=self.use_grayscale)
         self.chk_gray.pack(anchor="w", padx=15, pady=(5, 15))
 
+        # Signal Server
+        ctk.CTkLabel(self.settings_frame, text="信令服务器 (公网/局域网 IP:端口)").pack(anchor="w", padx=15, pady=(10, 0))
+        self.entry_signal_server = ctk.CTkEntry(self.settings_frame, placeholder_text="http://localhost:9000")
+        self.entry_signal_server.insert(0, "http://localhost:9000")
+        self.entry_signal_server.pack(fill="x", padx=15, pady=(0, 10))
+        self.entry_signal_server.bind("<KeyRelease>", self.update_signal_url)
+
         # 4. Tools Card (Firewall & Tunnel)
         self.tools_frame = ctk.CTkFrame(self.main_scroll)
         self.tools_frame.pack(fill="x", padx=20, pady=10)
@@ -266,6 +279,11 @@ class RemoteDesktopServer:
         # Firewall
         ctk.CTkButton(self.tools_frame, text="一键放行防火墙 (修复连接失败)", command=self.fix_firewall, fg_color="transparent", border_width=1, text_color=("gray10", "gray90")).pack(fill="x", padx=15, pady=5)
         
+        # Cloud Tunnel (New)
+        self.use_tunnel = ctk.BooleanVar(value=True)
+        self.chk_tunnel = ctk.CTkSwitch(self.tools_frame, text="启用云端隧道 (免公网IP/穿透)", variable=self.use_tunnel, font=("Arial", 12))
+        self.chk_tunnel.pack(anchor="w", padx=15, pady=10)
+
         # Ngrok
         self.use_ngrok = ctk.BooleanVar()
         self.chk_ngrok = ctk.CTkSwitch(self.tools_frame, text="启用 Ngrok 公网穿透", variable=self.use_ngrok, font=("Arial", 12))
@@ -380,9 +398,137 @@ class RemoteDesktopServer:
         
         print(f"Settings Updated: Res={self.target_res}, FPS={self.target_fps}")
 
+    def update_signal_url(self, event=None):
+        self.signal_server_url = self.entry_signal_server.get().strip()
+        # print(f"DEBUG: Signal Server URL updated to {self.signal_server_url}")
+
     def generate_password(self):
         chars = string.digits
         return ''.join(secrets.choice(chars) for _ in range(6))
+
+    def generate_device_id(self):
+        # Generate a 9-digit ID
+        return ''.join(secrets.choice(string.digits) for _ in range(9))
+
+    async def register_device_loop(self):
+        """Periodically register device ID with signal server"""
+        import aiohttp
+        from urllib.parse import urlparse
+        
+        while self.running:
+            try:
+                # 1. Default: LAN IP
+                final_ip = self.ip
+                final_port = self.port
+                mode = 'direct'
+                
+                # 2. Priority: Ngrok Public URL (if enabled)
+                if self.public_url:
+                    try:
+                        u = urlparse(self.public_url)
+                        final_ip = u.hostname
+                        # Handle port (default 80/443 if not specified)
+                        if u.port:
+                            final_port = u.port
+                        else:
+                            final_port = 443 if u.scheme == 'https' else 80
+                        print(f"DEBUG: Using Ngrok URL for registration: {final_ip}:{final_port}")
+                    except:
+                        pass
+                elif self.use_tunnel.get():
+                     mode = 'tunnel'
+                else:
+                    # 3. Fallback: PgyVPN / VPN IP detection
+                    try:
+                        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+                        for info in infos:
+                            curr = info[4][0]
+                            if curr.startswith("172.") or curr.startswith("10."):
+                                final_ip = curr
+                                break
+                    except: pass
+                
+                async with aiohttp.ClientSession() as session:
+                    payload = {
+                        'device_id': self.device_id,
+                        'port': final_port,
+                        'ip': final_ip,
+                        'mode': mode
+                    }
+                    async with session.post(f"{self.signal_server_url}/register", json=payload) as resp:
+                        if resp.status == 200:
+                            pass # Silent success
+                        else:
+                            print(f"DEBUG: Registration failed: {resp.status}")
+            except Exception as e:
+                print(f"DEBUG: Signal Server Error: {e}")
+            
+            await asyncio.sleep(30) # Heartbeat every 30s
+
+    async def maintain_tunnel_loop(self):
+        """Maintains a persistent WebSocket connection to Signal Server for Tunneling"""
+        import aiohttp
+        
+        while self.running:
+            if not self.use_tunnel.get():
+                await asyncio.sleep(2)
+                continue
+                
+            url = f"{self.signal_server_url}/device/{self.device_id}"
+            print(f"DEBUG: Connecting to Tunnel: {url}")
+            
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(url) as ws:
+                        print("DEBUG: Tunnel Connected")
+                        self.status_dot.configure(text_color="#00FF00")
+                        self.status_text.configure(text=" 云端隧道已连接", text_color="#00FF00")
+                        
+                        # Keep alive loop
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data = msg.data
+                                if data == "CLIENT_CONNECTED":
+                                    print("DEBUG: Tunnel Client Connected")
+                                    self.clients[ws] = {'authenticated': False}
+                                    # Send initial state
+                                    # await ws.send_json({'type': 'auth_req'}) # Client sends auth first
+                                elif data == "CLIENT_DISCONNECTED":
+                                    print("DEBUG: Tunnel Client Disconnected")
+                                    if ws in self.clients:
+                                        del self.clients[ws]
+                                else:
+                                    # Normal Command
+                                    try:
+                                        # Parse JSON
+                                        cmd = json.loads(data)
+                                        action = cmd.get('action')
+                                        
+                                        if action == 'auth':
+                                            if cmd.get('password') == self.password:
+                                                self.clients[ws]['authenticated'] = True
+                                                await ws.send_json({'type': 'auth_result', 'status': 'ok'})
+                                                await ws.send_json({'type': 'audio_config', 'rate': self.audio_config['rate'], 'channels': self.audio_config['channels']})
+                                                await ws.send_json({'type': 'sync_time', 'server_time': time.time() * 1000})
+                                                self.force_full_frame = True
+                                            else:
+                                                await ws.send_json({'type': 'auth_result', 'status': 'error'})
+                                        elif ws in self.clients and self.clients[ws]['authenticated']:
+                                            await self.process_command(ws, action, cmd)
+                                            
+                                    except json.JSONDecodeError:
+                                        pass
+                                    except Exception as e:
+                                        print(f"Tunnel Cmd Error: {e}")
+                                        
+                            elif msg.type == aiohttp.WSMsgType.ERROR:
+                                print(f"Tunnel Error: {ws.exception()}")
+                                break
+            except Exception as e:
+                print(f"Tunnel Connection Failed: {e}")
+                self.status_text.configure(text=" 隧道连接断开", text_color="orange")
+            
+            await asyncio.sleep(5) # Retry delay
 
     def refresh_password(self):
         self.password = self.generate_password()
@@ -659,6 +805,10 @@ class RemoteDesktopServer:
         self.runner = web.AppRunner(self.app)
         self.loop.run_until_complete(self.runner.setup())
         self.site = web.TCPSite(self.runner, '0.0.0.0', self.port)
+        
+        # Start Registration Task
+        self.loop.create_task(self.register_device_loop())
+        self.loop.create_task(self.maintain_tunnel_loop())
         
         try:
             self.loop.run_until_complete(self.site.start())
@@ -938,10 +1088,17 @@ class RemoteDesktopServer:
         
         with mss.mss() as sct:
             try:
-                sct_img = sct.grab(monitor)
-                if not sct_img: return None
-                
-                img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                try:
+                    sct_img = sct.grab(monitor)
+                    if not sct_img: return None
+                    img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                except Exception:
+                    # Fallback to GDI (ImageGrab) for Lock Screen support
+                    left = monitor['left']
+                    top = monitor['top']
+                    right = left + monitor['width']
+                    bottom = top + monitor['height']
+                    img = ImageGrab.grab(bbox=(left, top, right, bottom))
                 
                 # Resize (Must be consistent for diff)
                 if target_res:

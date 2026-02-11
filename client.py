@@ -76,10 +76,10 @@ class RemoteDesktopClient:
         self.input_card = ctk.CTkFrame(self.main_frame)
         self.input_card.pack(pady=10, padx=30, fill="x")
         
-        ctk.CTkLabel(self.input_card, text="伙伴设备码 (IP)", font=("Arial", 12)).pack(anchor="w", padx=15, pady=(15, 5))
-        self.entry_ip = ctk.CTkEntry(self.input_card, placeholder_text="例如: 192.168.1.5", height=35)
+        ctk.CTkLabel(self.input_card, text="伙伴设备码 (ID 或 IP)", font=("Arial", 12)).pack(anchor="w", padx=15, pady=(15, 5))
+        self.entry_ip = ctk.CTkEntry(self.input_card, placeholder_text="例如: 123456789 或 192.168.1.5", height=35)
         self.entry_ip.pack(fill="x", padx=15, pady=(0, 15))
-        self.entry_ip.insert(0, "127.0.0.1") 
+        # self.entry_ip.insert(0, "127.0.0.1") 
         
         ctk.CTkLabel(self.input_card, text="访问验证码", font=("Arial", 12)).pack(anchor="w", padx=15, pady=(0, 5))
         self.entry_pass = ctk.CTkEntry(self.input_card, show="*", placeholder_text="输入6位数字", height=35)
@@ -88,27 +88,112 @@ class RemoteDesktopClient:
         # Connect Button
         self.btn_connect = ctk.CTkButton(self.main_frame, text="立即连接", command=self.connect, 
                                          font=("Arial", 14, "bold"), height=40)
-        self.btn_connect.pack(pady=30, fill="x", padx=30)
+        self.btn_connect.pack(pady=(20, 10), fill="x", padx=30)
         
+        # Settings Toggle
+        self.settings_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.settings_frame.pack(fill="x", padx=30)
+        
+        self.show_settings = ctk.BooleanVar(value=False)
+        self.btn_settings = ctk.CTkCheckBox(self.settings_frame, text="显示高级设置", variable=self.show_settings, command=self.toggle_settings)
+        self.btn_settings.pack(anchor="w")
+        
+        self.adv_frame = ctk.CTkFrame(self.main_frame)
+        # self.adv_frame.pack(fill="x", padx=30, pady=10) # Hidden by default
+        
+        ctk.CTkLabel(self.adv_frame, text="信令服务器地址:", font=("Arial", 10)).pack(anchor="w", padx=10, pady=(5,0))
+        self.entry_signal = ctk.CTkEntry(self.adv_frame, height=28)
+        self.entry_signal.pack(fill="x", padx=10, pady=(0, 10))
+        self.entry_signal.insert(0, "http://localhost:9000")
+
         # Footer
         ctk.CTkLabel(self.main_frame, text="安全加密连接 | 极速传输", text_color="gray", font=("Arial", 10)).pack(side="bottom", pady=20)
         
+    def toggle_settings(self):
+        if self.show_settings.get():
+            self.adv_frame.pack(fill="x", padx=30, pady=10)
+        else:
+            self.adv_frame.pack_forget()
+
     def connect(self):
-        self.host = self.entry_ip.get().strip()
+        input_val = self.entry_ip.get().strip()
         self.password = self.entry_pass.get().strip()
         
-        if not self.host or not self.password:
+        if not input_val or not self.password:
             messagebox.showwarning("输入错误", "请输入伙伴设备码和验证码")
             return
+
+        # Check if input is a 9-digit Device ID
+        if input_val.isdigit() and len(input_val) == 9:
+            try:
+                import requests
+                signal_url = "http://localhost:9000/lookup/" + input_val
+                resp = requests.get(signal_url, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    self.host = data['ip']
+                    if 'port' in data and str(data['port']) != str(DEFAULT_PORT):
+                         self.host = f"{self.host}:{data['port']}"
+                else:
+                    messagebox.showerror("连接失败", "未找到该设备 ID (设备可能离线)")
+                    return
+            except Exception as e:
+                messagebox.showerror("连接错误", f"无法解析设备 ID: {e}")
+                return
+        else:
+            self.host = input_val
             
         # Start connection in separate thread to not freeze UI
         self.running = True
         self.btn_connect.configure(state="disabled", text="正在连接...")
         threading.Thread(target=self.run_async_connect, daemon=True).start()
 
+    def resolve_device_id(self, device_id):
+        """Resolves 9-digit ID to IP:Port via Signal Server"""
+        import urllib.request
+        import json
+        
+        signal_server = self.entry_signal.get().strip()
+        if not signal_server.startswith("http"):
+             signal_server = "http://" + signal_server
+             
+        url = f"{signal_server}/lookup/{device_id}"
+        print(f"DEBUG: Resolving Device ID {device_id} via {url}...")
+        
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                if response.status == 200:
+                    data = json.loads(response.read().decode())
+                    
+                    if data.get('mode') == 'tunnel':
+                        print(f"DEBUG: Resolved to Tunnel Mode")
+                        return f"tunnel://{device_id}"
+                        
+                    ip = data.get('ip')
+                    port = data.get('port')
+                    print(f"DEBUG: Resolved to {ip}:{port}")
+                    return f"{ip}:{port}"
+        except Exception as e:
+            print(f"DEBUG: Resolution failed: {e}")
+            return None
+        return None
+
     def run_async_connect(self):
-        # 1. Diagnose Connection First
-        self.diagnose_connection()
+        # 0. Check for Device ID (9 digits)
+        raw_input = self.host.strip()
+        if raw_input.isdigit() and len(raw_input) == 9:
+            self.root.after(0, lambda: self.btn_connect.configure(text="解析 ID 中..."))
+            resolved = self.resolve_device_id(raw_input)
+            if resolved:
+                self.host = resolved
+            else:
+                self.root.after(0, lambda: messagebox.showerror("连接失败", "无法解析设备 ID (设备离线或服务器不可达)"))
+                self.root.after(0, lambda: self.btn_connect.configure(state="normal", text="立即连接"))
+                return
+
+        # 1. Diagnose Connection First (Skip for Tunnel)
+        if not self.host.startswith("tunnel://"):
+            self.diagnose_connection()
         
         # 2. Run Main Loop
         loop = asyncio.new_event_loop()
@@ -184,38 +269,59 @@ class RemoteDesktopClient:
         # Normalize Input
         raw_host = self.host.strip()
         
-        # Remove protocol if present
-        protocol = "ws"
-        if raw_host.startswith("http://"):
-            raw_host = raw_host[7:]
-        elif raw_host.startswith("https://"):
-            raw_host = raw_host[8:]
-            protocol = "wss"
-        elif raw_host.startswith("ws://"):
-            raw_host = raw_host[5:]
-        elif raw_host.startswith("wss://"):
-            raw_host = raw_host[6:]
-            protocol = "wss"
-        
-        if "ngrok" in raw_host: protocol = "wss"
+        if raw_host.startswith("tunnel://"):
+            # Tunnel Mode
+            device_id = raw_host.replace("tunnel://", "")
+            signal_server = self.entry_signal.get().strip()
+            
+            # Convert HTTP signal URL to WS URL
+            if signal_server.startswith("https://"):
+                base = signal_server.replace("https://", "wss://")
+            elif signal_server.startswith("http://"):
+                base = signal_server.replace("http://", "ws://")
+            else:
+                base = f"ws://{signal_server}"
+                
+            # If port is missing in signal server url, add it? 
+            # Usually signal server url includes port if non-standard.
+            
+            url = f"{base}/client/{device_id}"
+            print(f"DEBUG: Connecting via Tunnel: {url}")
+            
+        else:
+            # Direct Mode
+            # Remove protocol if present
+            protocol = "ws"
+            if raw_host.startswith("http://"):
+                raw_host = raw_host[7:]
+            elif raw_host.startswith("https://"):
+                raw_host = raw_host[8:]
+                protocol = "wss"
+            elif raw_host.startswith("ws://"):
+                raw_host = raw_host[5:]
+            elif raw_host.startswith("wss://"):
+                raw_host = raw_host[6:]
+                protocol = "wss"
+            
+            if "ngrok" in raw_host: protocol = "wss"
 
-        # Check for IPv6 or custom port
-        address_part = raw_host
-        has_port = False
-        if raw_host.startswith("["):
-            if "]:" in raw_host:
-                has_port = True
-        elif ":" in raw_host:
-            if raw_host.count(":") == 1:
-                has_port = True
-            elif raw_host.count(":") > 1 and not raw_host.startswith("["):
-                address_part = f"[{raw_host}]:{DEFAULT_PORT}"
-                has_port = True 
-        
-        if not has_port:
-             address_part = f"{raw_host}:{DEFAULT_PORT}"
+            # Check for IPv6 or custom port
+            address_part = raw_host
+            has_port = False
+            if raw_host.startswith("["):
+                if "]:" in raw_host:
+                    has_port = True
+            elif ":" in raw_host:
+                if raw_host.count(":") == 1:
+                    has_port = True
+                elif raw_host.count(":") > 1 and not raw_host.startswith("["):
+                    address_part = f"[{raw_host}]:{DEFAULT_PORT}"
+                    has_port = True 
+            
+            if not has_port:
+                 address_part = f"{raw_host}:{DEFAULT_PORT}"
 
-        url = f"{protocol}://{address_part}/ws"
+            url = f"{protocol}://{address_part}/ws"
         
         print(f"DEBUG: Connecting to: {url}")
 
@@ -473,6 +579,9 @@ class RemoteDesktopClient:
         self.btn_chat = tk.Button(self.root, text="💬", bg="black", fg="white", font=("Arial", 16), command=self.toggle_chat, borderwidth=0)
         self.btn_chat.place(relx=1.0, rely=1.0, anchor=tk.SE, x=-20, y=-20)
         
+        # Display Mode
+        self.scale_mode = 'fit' # fit, stretch, original
+
         # Chat Window (Hidden by default)
         self.chat_window = None
 
@@ -579,6 +688,11 @@ class RemoteDesktopClient:
             await self.ws.send_json(payload)
         except: pass
 
+    def set_scale_mode(self, mode):
+        self.scale_mode = mode
+        if hasattr(self, 'current_image_obj') and self.current_image_obj:
+            self.update_image_safe(self.current_image_obj)
+
     def update_image_safe(self, image):
         try:
             self.current_image_obj = image # Keep reference
@@ -589,21 +703,35 @@ class RemoteDesktopClient:
             
             # Only scale if window is valid
             if win_w > 1 and win_h > 1:
-                # Aspect Ratio
                 img_w, img_h = image.size
-                ratio = min(win_w / img_w, win_h / img_h)
-                new_w = int(img_w * ratio)
-                new_h = int(img_h * ratio)
+                
+                if self.scale_mode == 'fit':
+                    # Aspect Ratio
+                    ratio = min(win_w / img_w, win_h / img_h)
+                    new_w = int(img_w * ratio)
+                    new_h = int(img_h * ratio)
+                elif self.scale_mode == 'stretch':
+                    # Stretch to fill
+                    new_w = win_w
+                    new_h = win_h
+                else: # original
+                    new_w = img_w
+                    new_h = img_h
                 
                 self.scale_x = new_w / img_w
                 self.scale_y = new_h / img_h
                 self.img_w = new_w
                 self.img_h = new_h
                 
-                image = image.resize((new_w, new_h), Image.Resampling.NEAREST) # Nearest is fast
+                if new_w != img_w or new_h != img_h:
+                    image = image.resize((new_w, new_h), Image.Resampling.NEAREST) # Nearest is fast
                 
             self.tk_image = ImageTk.PhotoImage(image)
-            self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_image)
+            
+            # Center the image
+            self.canvas.delete("all")
+            self.canvas.create_image(win_w // 2, win_h // 2, anchor=tk.CENTER, image=self.tk_image)
+            
         except Exception as e:
             print(f"Render Error: {e}")
 
